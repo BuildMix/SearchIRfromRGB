@@ -12,7 +12,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # ==========================================
-# VGG前三层
+# Part 1: 模型与预处理 (保持不变)
 # ==========================================
 class VGGBlock3Extractor(nn.Module):
     def __init__(self):
@@ -28,9 +28,6 @@ class VGGBlock3Extractor(nn.Module):
         feat = self.inst_norm(feat)
         return feat
 
-# ==========================================
-# Sobel滤波预处理
-# ==========================================
 def apply_sobel_algorithm(gray_img):
     sobel_x = cv2.Sobel(gray_img, cv2.CV_64F, 1, 0, ksize=3)
     sobel_y = cv2.Sobel(gray_img, cv2.CV_64F, 0, 1, ksize=3)
@@ -38,9 +35,6 @@ def apply_sobel_algorithm(gray_img):
     abs_y = cv2.convertScaleAbs(sobel_y)
     return cv2.addWeighted(abs_x, 0.5, abs_y, 0.5, 0)
 
-# ==========================================
-# 图片处理
-# ==========================================
 def process_image(image_path):
     if not os.path.exists(image_path):
         return None, None, None
@@ -58,9 +52,6 @@ def process_image(image_path):
     img_tensor = transform(sobel_rgb).unsqueeze(0)
     return img_tensor, sobel_img, cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
 
-# ==========================================
-# 相关性计算
-# ==========================================
 def correlation_layer(feat_rgb, feat_ir):
     B, C, H, W = feat_rgb.shape
     N = H * W
@@ -72,9 +63,9 @@ def correlation_layer(feat_rgb, feat_ir):
     return correlation_matrix
 
 # ==========================================
-# 智能缩放
+# Part 2: Step 4 智能缩放版 (保持不变)
 # ==========================================
-def ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
+def step4_ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
     B, N, N_dim = corr_matrix.shape
     H_feat, W_feat = feat_size
     H_orig, W_orig = orig_size
@@ -158,7 +149,7 @@ def ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
     return transformed_corners, inliers
 
 # ==========================================
-# 加载标签
+# Part 3: 辅助函数
 # ==========================================
 def load_yolo_labels(txt_path):
     boxes = []
@@ -262,7 +253,7 @@ def visualize_batch_results(rgb_img, ir_img, results, save_dir, img_id):
     plt.close(fig)
 
 # ==========================================
-# 汇总结果到 results.txt
+# Part 4: 新增功能 - 汇总结果到 results.txt
 # ==========================================
 def append_results_to_summary(txt_path, img_id, results):
     """
@@ -416,7 +407,7 @@ def main():
         img_valid_count = 0
         
         for i, box in enumerate(all_boxes):
-            trans_corners, _ = ransac_smart(
+            trans_corners, _ = step4_ransac_smart(
                 corr_matrix, box, rgb_sobel, feat_size, orig_size
             )
             
