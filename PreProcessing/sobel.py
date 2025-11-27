@@ -54,8 +54,8 @@ def load_and_process_images(rgb_path, ir_path):
 # --- 3. 主函数 (包含保存逻辑) ---
 def main():
     # --- 配置部分 ---
-    rgb_filename = 'visible.png'
-    ir_filename = 'infrared.png'
+    rgb_filename = './PreProcessing/visible.png'
+    ir_filename = './PreProcessing/infrared.png'
     
     # 四宫格大图的输出文件名
     output_grid_filename = 'output_sobel.png'

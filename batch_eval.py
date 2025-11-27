@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import os
 import math
+from pathlib import Path
 
 # ==========================================
 # Part 1: 模型与预处理 (保持不变)
@@ -145,7 +146,7 @@ def step4_ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
     return transformed_corners, inliers
 
 # ==========================================
-# Part 3: 辅助函数 (标签读取 & 误差计算)
+# Part 3: 辅助函数 (标签读取 & 误差计算 & 路径管理)
 # ==========================================
 def load_yolo_labels(txt_path):
     boxes = []
@@ -169,36 +170,25 @@ def calculate_errors(orig_box_norm, trans_corners, img_w, img_h):
     """
     计算原标签与匹配标签的误差
     """
-    # 1. 计算原标签的像素信息 (Ground Truth)
     ncx, ncy, nw, nh = orig_box_norm
     gt_cx = ncx * img_w
     gt_cy = ncy * img_h
     gt_w = nw * img_w
     gt_h = nh * img_h
     
-    # 2. 计算预测标签的像素信息 (Predicted)
-    # trans_corners 顺序: 左上, 右上, 右下, 左下
     pts = trans_corners.reshape(4, 2)
-    
-    # 中心点: 四个角点的平均值
     pred_cx = np.mean(pts[:, 0])
     pred_cy = np.mean(pts[:, 1])
     
-    # 宽度: (右上-左上 + 右下-左下) / 2
     top_w = np.linalg.norm(pts[1] - pts[0])
     bottom_w = np.linalg.norm(pts[2] - pts[3])
     pred_w = (top_w + bottom_w) / 2.0
     
-    # 高度: (左下-左上 + 右下-右上) / 2
     left_h = np.linalg.norm(pts[3] - pts[0])
     right_h = np.linalg.norm(pts[2] - pts[1])
     pred_h = (left_h + right_h) / 2.0
     
-    # 3. 计算误差
-    # 中心偏移量 (像素)
     center_error = math.sqrt((gt_cx - pred_cx)**2 + (gt_cy - pred_cy)**2)
-    
-    # 尺寸误差 (像素)
     width_error = pred_w - gt_w
     height_error = pred_h - gt_h
     
@@ -212,7 +202,28 @@ def calculate_errors(orig_box_norm, trans_corners, img_w, img_h):
         'height_error': height_error
     }
 
-def visualize_batch_results(rgb_img, ir_img, results):
+def increment_path(path, exist_ok=False, sep='', mkdir=False):
+    """
+    递增路径，例如: runs/exp -> runs/exp1 -> runs/exp2 ...
+    """
+    path = Path(path)
+    if path.exists() and not exist_ok:
+        path, suffix = (path.with_suffix(''), path.suffix) if path.is_file() else (path, '')
+        
+        # 查找下一个可用的索引
+        for n in range(1, 9999):
+            p = f'{path}{sep}{n}{suffix}'
+            if not os.path.exists(p):
+                path = Path(p)
+                break
+    if mkdir:
+        path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+def visualize_batch_results(rgb_img, ir_img, results, save_dir, img_id):
+    """
+    可视化并保存结果，文件名包含 img_id
+    """
     H, W = rgb_img.shape[:2]
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
     
@@ -242,20 +253,36 @@ def visualize_batch_results(rgb_img, ir_img, results):
     ax1.axis('off')
     ax2.axis('off')
     plt.tight_layout()
-    save_path = "batch_result_eval.png"
+    
+    # 动态构建文件名
+    save_name = f"batch_result_eval_{img_id}.png"
+    save_path = os.path.join(save_dir, save_name)
+    
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
     print(f"\n对比图已保存: {save_path}")
-    plt.show()
+    # plt.show() # 如果跑批处理可以注释掉这一行，避免弹出窗口
 
 # ==========================================
 # 主流程
 # ==========================================
 def main():
-    rgb_path = './Datasets/visible.png'
-    ir_path = './Datasets/infrared.png'
-    label_path = './Datasets/00000.txt' 
+    # 1. 设置路径
+    rgb_path = './Datasets/01396_vi.png'
+    ir_path = './Datasets/01396_ir.png'
+    label_path = './Datasets/01396.txt' 
 
-    print("1. 加载模型与图片...")
+    # 提取 ID: 从 './Datasets/01396_vi.png' 提取 '01396'
+    # 假设文件名格式为 "ID_xx.png" 或 "ID.png"
+    filename = os.path.basename(rgb_path)
+    img_id = filename.split('_')[0] if '_' in filename else filename.split('.')[0]
+
+    # 2. 设置保存目录 (runs/exp, runs/exp1, ...)
+    project = 'runs'
+    name = 'exp'
+    save_dir = increment_path(Path(project) / name, exist_ok=False, mkdir=True)
+    print(f"结果将保存至: {save_dir}")
+
+    print("3. 加载模型与图片...")
     model = VGGBlock3Extractor()
     model.eval()
     
@@ -263,10 +290,10 @@ def main():
     ir_tensor, _, ir_viz = process_image(ir_path)
     if rgb_tensor is None: return
 
-    print(f"2. 读取标签: {label_path}")
+    print(f"4. 读取标签: {label_path}")
     all_boxes = load_yolo_labels(label_path)
     
-    print("3. 计算全局特征...")
+    print("5. 计算全局特征...")
     with torch.no_grad():
         rgb_feat = model(rgb_tensor)
         ir_feat = model(ir_tensor)
@@ -320,7 +347,8 @@ def main():
     else:
         print("无有效配准目标。")
 
-    visualize_batch_results(rgb_viz, ir_viz, final_results)
+    # 传入保存目录和图片ID
+    visualize_batch_results(rgb_viz, ir_viz, final_results, save_dir, img_id)
 
 if __name__ == "__main__":
     main()

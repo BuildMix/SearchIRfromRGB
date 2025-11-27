@@ -8,6 +8,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import os
 import math
+from pathlib import Path
+from tqdm import tqdm  # 引入进度条库，如果没有安装，可以用 pip install tqdm 安装，或者删除相关代码
 
 # ==========================================
 # Part 1: 模型与预处理 (保持不变)
@@ -34,10 +36,13 @@ def apply_sobel_algorithm(gray_img):
     return cv2.addWeighted(abs_x, 0.5, abs_y, 0.5, 0)
 
 def process_image(image_path):
+    # 这里不再打印错误，改为返回None由主循环处理
     if not os.path.exists(image_path):
-        print(f"错误: 找不到文件 {image_path}")
-        return None, None, None, None
+        return None, None, None
     orig_img = cv2.imread(image_path)
+    if orig_img is None:
+        return None, None, None
+        
     gray_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2GRAY)
     sobel_img = apply_sobel_algorithm(gray_img) 
     sobel_rgb = cv2.merge([sobel_img, sobel_img, sobel_img])
@@ -59,21 +64,19 @@ def correlation_layer(feat_rgb, feat_ir):
     return correlation_matrix
 
 # ==========================================
-# Part 2: Step 4 智能缩放版 (Smart Scale RANSAC)
+# Part 2: Step 4 智能缩放版 (保持不变)
 # ==========================================
 def step4_ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
     B, N, N_dim = corr_matrix.shape
     H_feat, W_feat = feat_size
     H_orig, W_orig = orig_size
     
-    # 1. 解析 YOLO 框
     ncx, ncy, nw, nh = norm_box
     pcx, pcy = int(ncx * W_orig), int(ncy * H_orig)
     pw, ph = int(nw * W_orig), int(nh * H_orig)
     x_min, y_min = pcx - pw//2, pcy - ph//2
     x_max, y_max = pcx + pw//2, pcy + ph//2
 
-    # 2. 采样 (网格点)
     grid_size = 6
     xs = np.linspace(x_min + pw*0.1, x_max - pw*0.1, grid_size)
     ys = np.linspace(y_min + ph*0.1, y_max - ph*0.1, grid_size)
@@ -83,13 +86,10 @@ def step4_ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
     valid_matches_src = []
     valid_matches_dst = []
     
-    # 低阈值 + 空间约束
     sobel_threshold = 15 
     search_radius = W_orig // 3 
     feat_search_radius = search_radius * (W_feat / W_orig)
 
-    print(f"\n--- RANSAC 过程 (智能缩放版) ---")
-    
     for pt in points_rgb:
         px, py = int(pt[0]), int(pt[1])
         if px < 0 or px >= W_orig or py < 0 or py >= H_orig: continue
@@ -100,7 +100,6 @@ def step4_ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
         fx, fy = min(max(fx, 0), W_feat - 1), min(max(fy, 0), H_feat - 1)
         query_idx = fy * W_feat + fx
         
-        # 空间掩码
         corr_row = corr_matrix[0, query_idx, :]
         mask = torch.ones_like(corr_row) * float('-inf')
         win_x_min = max(0, int(fx - feat_search_radius))
@@ -113,7 +112,6 @@ def step4_ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
         masked_corr = corr_row + mask_2d.view(-1)
         
         max_idx = torch.argmax(masked_corr).item()
-        
         match_fy = max_idx // W_feat
         match_fx = max_idx % W_feat
         match_px = int(match_fx * (W_orig / W_feat))
@@ -125,117 +123,286 @@ def step4_ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
     valid_matches_src = np.array(valid_matches_src, dtype=np.float32)
     valid_matches_dst = np.array(valid_matches_dst, dtype=np.float32)
     
-    print(f"有效匹配点数: {len(valid_matches_src)}")
     if len(valid_matches_src) < 3: return None, None
 
-    # --- 3. 核心改进：带检查的仿射变换 ---
-    
-    # A. 尝试计算仿射矩阵 (允许平移+旋转+缩放)
     M_affine, inliers = cv2.estimateAffinePartial2D(valid_matches_src, valid_matches_dst, method=cv2.RANSAC, ransacReprojThreshold=10.0)
     
     use_fallback = True
     final_M = None
 
     if M_affine is not None:
-        # B. 提取缩放系数 (Scale)
-        # M = [[a, -b, tx], [b, a, ty]]
-        # scale = sqrt(a^2 + b^2)
         a = M_affine[0, 0]
         b = M_affine[1, 0]
         scale = math.sqrt(a**2 + b**2)
-        
-        print(f"RANSAC 计算出的缩放系数: {scale:.4f}")
-
-        # C. 熔断检查 (Sanity Check)
-        # 我们允许 0.8 ~ 1.2 的缩放。超出这个范围认为是不合理的漂移。
         if 0.8 <= scale <= 1.2:
-            print(">> 缩放系数合理，采用 RANSAC 结果。")
             final_M = M_affine
             use_fallback = False
-        else:
-            print(">> 警告：缩放系数异常 (过大或过小)！触发熔断机制。")
     
-    # D. 自动降级 (Fallback): 中值流 (仅平移)
     if use_fallback:
-        print(">> 启动 B 计划：仅计算平移 (Scale=1.0)")
         deltas = valid_matches_dst - valid_matches_src
         dx = np.median(deltas[:, 0])
         dy = np.median(deltas[:, 1])
         final_M = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
-        # 伪造一个全 1 的 inliers，因为中值对所有点都有效
-        inliers = np.ones((len(valid_matches_src), 1), dtype=np.uint8)
 
-    # 4. 变换原始框
     box_corners = np.array([[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]], dtype=np.float32).reshape(-1, 1, 2)
     transformed_corners = cv2.transform(box_corners, final_M)
     
     return transformed_corners, inliers
 
 # ==========================================
-# Part 3: 可视化 (保持不变)
+# Part 3: 辅助函数
 # ==========================================
-def visualize_final_comparison(rgb_img, ir_img, trans_corners, norm_box):
-    H, W = rgb_img.shape[:2]
-    ncx, ncy, nw, nh = norm_box
-    pcx, pcy = int(ncx * W), int(ncy * H)
-    pw, ph = int(nw * W), int(nh * H)
+def load_yolo_labels(txt_path):
+    boxes = []
+    if not os.path.exists(txt_path):
+        return boxes
+    with open(txt_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 5:
+                box = [float(x) for x in parts[1:5]]
+                boxes.append(box)
+    return boxes
+
+def get_distinct_colors(num_colors):
+    cmap = plt.get_cmap('hsv')
+    colors = [cmap(i) for i in np.linspace(0, 0.9, num_colors)]
+    return colors
+
+def calculate_errors(orig_box_norm, trans_corners, img_w, img_h):
+    ncx, ncy, nw, nh = orig_box_norm
+    gt_cx = ncx * img_w
+    gt_cy = ncy * img_h
+    gt_w = nw * img_w
+    gt_h = nh * img_h
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7))
+    pts = trans_corners.reshape(4, 2)
+    pred_cx = np.mean(pts[:, 0])
+    pred_cy = np.mean(pts[:, 1])
+    
+    top_w = np.linalg.norm(pts[1] - pts[0])
+    bottom_w = np.linalg.norm(pts[2] - pts[3])
+    pred_w = (top_w + bottom_w) / 2.0
+    
+    left_h = np.linalg.norm(pts[3] - pts[0])
+    right_h = np.linalg.norm(pts[2] - pts[1])
+    pred_h = (left_h + right_h) / 2.0
+    
+    center_error = math.sqrt((gt_cx - pred_cx)**2 + (gt_cy - pred_cy)**2)
+    width_error = pred_w - gt_w
+    height_error = pred_h - gt_h
+    
+    return {
+        'gt_center': (gt_cx, gt_cy),
+        'pred_center': (pred_cx, pred_cy),
+        'gt_size': (gt_w, gt_h),
+        'pred_size': (pred_w, pred_h),
+        'center_error': center_error,
+        'width_error': width_error,
+        'height_error': height_error
+    }
+
+def increment_path(path, exist_ok=False, sep='', mkdir=False):
+    path = Path(path)
+    if path.exists() and not exist_ok:
+        path, suffix = (path.with_suffix(''), path.suffix) if path.is_file() else (path, '')
+        for n in range(1, 9999):
+            p = f'{path}{sep}{n}{suffix}'
+            if not os.path.exists(p):
+                path = Path(p)
+                break
+    if mkdir:
+        path.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+def visualize_batch_results(rgb_img, ir_img, results, save_dir, img_id):
+    """
+    可视化并保存结果，文件名改为 {img_id}_results.png
+    """
+    H, W = rgb_img.shape[:2]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
     
     ax1.imshow(rgb_img)
-    ax1.set_title("Original Input (Visible)")
-    rect_rgb = patches.Rectangle((pcx - pw//2, pcy - ph//2), pw, ph, linewidth=3, edgecolor='yellow', facecolor='none')
-    ax1.add_patch(rect_rgb)
-    ax1.axis('off')
-
+    ax1.set_title(f"Visible ({img_id}) - {len(results)} targets")
+    
     ax2.imshow(ir_img)
-    ax2.set_title("Robust Registration Result (Infrared)")
-    pts = trans_corners.reshape(-1, 2)
-    poly = patches.Polygon(pts, linewidth=3, edgecolor='#00FF00', facecolor='none')
-    ax2.add_patch(poly)
-    ax2.axis('off')
+    ax2.set_title(f"Infrared ({img_id}) - Result")
 
+    for item in results:
+        color = item['color']
+        
+        # 左图
+        ncx, ncy, nw, nh = item['orig_box']
+        pcx, pcy = int(ncx * W), int(ncy * H)
+        pw, ph = int(nw * W), int(nh * H)
+        rect = patches.Rectangle((pcx - pw//2, pcy - ph//2), pw, ph, 
+                                 linewidth=2, edgecolor=color, facecolor='none')
+        ax1.add_patch(rect)
+
+        # 右图
+        if item['trans_box'] is not None:
+            pts = item['trans_box'].reshape(-1, 2)
+            poly = patches.Polygon(pts, linewidth=2, edgecolor=color, facecolor='none')
+            ax2.add_patch(poly)
+    
+    ax1.axis('off')
+    ax2.axis('off')
     plt.tight_layout()
-    save_path = "final_result.png"
+    
+    # 修改文件名格式
+    save_name = f"{img_id}_results.png"
+    save_path = os.path.join(save_dir, save_name)
+    
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
-    print(f"对比结果已保存: {save_path}")
-    plt.show()
+    plt.close(fig) # 关闭图像以释放内存，避免批量处理时内存溢出
+    # print(f"保存: {save_path}")
 
 # ==========================================
 # 主流程
 # ==========================================
 def main():
-    rgb_path = './Datasets/visible.png'
-    ir_path = './Datasets/infrared.png'
-    input_box_norm = [0.5546875, 0.5716145833333333, 0.142578125, 0.18489583333333331]
+    # 1. 设置数据集根目录
+    root_dir = './Datasets'
+    vi_dir = os.path.join(root_dir, 'vi')
+    ir_dir = os.path.join(root_dir, 'ir')
+    labels_dir = os.path.join(root_dir, 'labels')
 
-    print("加载模型...")
+    # 2. 设置保存目录 (runs/exp, runs/exp1, ...)
+    project = 'runs'
+    name = 'exp'
+    save_dir = increment_path(Path(project) / name, exist_ok=False, mkdir=True)
+    print(f"==========================================")
+    print(f"  批量配准开始")
+    print(f"  输入目录: {root_dir}")
+    print(f"  输出目录: {save_dir}")
+    print(f"==========================================\n")
+
+    # 3. 加载模型
+    print("正在加载模型...", end='')
     model = VGGBlock3Extractor()
     model.eval()
+    print(" 完成\n")
 
-    print("Step 1-3...")
-    rgb_tensor, rgb_sobel, rgb_viz = process_image(rgb_path)
-    ir_tensor, _, ir_viz = process_image(ir_path)
-    if rgb_tensor is None: return
+    # 4. 获取所有待处理的文件ID
+    # 假设以 visible 文件夹中的图片为基准
+    supported_exts = ('.png', '.jpg', '.jpeg', '.bmp')
+    if not os.path.exists(vi_dir):
+        print(f"错误: 找不到目录 {vi_dir}")
+        return
 
-    with torch.no_grad():
-        rgb_feat = model(rgb_tensor)
-        ir_feat = model(ir_tensor)
-
-    corr_matrix = correlation_layer(rgb_feat, ir_feat)
-
-    print("Step 4: RANSAC (智能缩放版)...")
-    feat_size = (rgb_feat.shape[2], rgb_feat.shape[3])
-    orig_size = rgb_viz.shape[:2]
+    # 扫描 vi 文件夹，获取不带后缀的文件名作为 ID
+    file_list = [f for f in os.listdir(vi_dir) if f.lower().endswith(supported_exts)]
+    file_ids = [os.path.splitext(f)[0] for f in file_list]
     
-    trans_corners, inliers = step4_ransac_smart(
-        corr_matrix, input_box_norm, rgb_sobel, feat_size, orig_size
-    )
+    file_ids.sort() # 排序，保证处理顺序一致
     
-    if trans_corners is not None:
-        visualize_final_comparison(rgb_viz, ir_viz, trans_corners, input_box_norm)
-    else:
-        print("配准失败。")
+    total_files = len(file_ids)
+    print(f"发现 {total_files} 组图像待处理。\n")
+
+    # 5. 批量处理循环
+    # 使用 tqdm 显示进度条 (可选，如果不喜欢可以删掉 tqdm 包装)
+    try:
+        iterator = tqdm(file_ids, desc="Processing")
+    except ImportError:
+        iterator = file_ids
+
+    for img_id in iterator:
+        # 构建完整路径
+        # 注意：这里假设 vi 和 ir 的扩展名可能不同，或者我们只知道 id
+        # 为简单起见，假设 vi 和 ir 都是 .png (或者在扫描时动态匹配)
+        # 这里为了稳健，尝试匹配真实存在的文件名
+        
+        # 寻找 VI 路径
+        vi_path = None
+        for ext in supported_exts:
+            p = os.path.join(vi_dir, img_id + ext)
+            if os.path.exists(p):
+                vi_path = p
+                break
+        
+        # 寻找 IR 路径
+        ir_path = None
+        for ext in supported_exts:
+            p = os.path.join(ir_dir, img_id + ext)
+            if os.path.exists(p):
+                ir_path = p
+                break
+                
+        # 寻找 Label 路径
+        label_path = os.path.join(labels_dir, img_id + ".txt")
+
+        # 检查文件完整性
+        if not vi_path or not ir_path:
+            print(f"\n[跳过] ID: {img_id} - 缺少图片文件")
+            continue
+            
+        if not os.path.exists(label_path):
+            print(f"\n[跳过] ID: {img_id} - 缺少标签文件 ({label_path})")
+            continue
+
+        # --- 单张图片处理逻辑开始 ---
+        
+        # 加载图片
+        rgb_tensor, rgb_sobel, rgb_viz = process_image(vi_path)
+        ir_tensor, _, ir_viz = process_image(ir_path)
+        
+        if rgb_tensor is None or ir_tensor is None:
+            continue
+
+        # 加载标签
+        all_boxes = load_yolo_labels(label_path)
+        if len(all_boxes) == 0:
+            print(f"\n[提示] ID: {img_id} - 标签文件为空")
+            continue
+
+        # 特征提取
+        with torch.no_grad():
+            rgb_feat = model(rgb_tensor)
+            ir_feat = model(ir_tensor)
+        
+        corr_matrix = correlation_layer(rgb_feat, ir_feat)
+        feat_size = (rgb_feat.shape[2], rgb_feat.shape[3])
+        orig_size = rgb_viz.shape[:2]
+        img_h, img_w = orig_size
+
+        # 打印当前图片的处理表头 (可选，为了不刷屏太多，可以只打印汇总，或者保留)
+        # print(f"\n处理: {img_id}") 
+        
+        colors = get_distinct_colors(len(all_boxes))
+        final_results = []
+        img_total_error = 0
+        img_valid_count = 0
+        
+        # 遍历该图片下的所有 Box
+        for i, box in enumerate(all_boxes):
+            trans_corners, _ = step4_ransac_smart(
+                corr_matrix, box, rgb_sobel, feat_size, orig_size
+            )
+            
+            if trans_corners is not None:
+                metrics = calculate_errors(box, trans_corners, img_w, img_h)
+                img_total_error += metrics['center_error']
+                img_valid_count += 1
+                
+                final_results.append({
+                    'orig_box': box,
+                    'trans_box': trans_corners,
+                    'color': colors[i]
+                })
+        
+        # 打印该图片的平均误差
+        if img_valid_count > 0:
+            avg_err = img_total_error / img_valid_count
+            tqdm.write(f"ID: {img_id:<6} | 目标数: {len(all_boxes)} | 平均误差: {avg_err:.2f} px")
+        else:
+            tqdm.write(f"ID: {img_id:<6} | [匹配失败]")
+
+        # 保存结果图
+        visualize_batch_results(rgb_viz, ir_viz, final_results, save_dir, img_id)
+
+    print(f"\n==========================================")
+    print(f"  处理完成。所有结果已保存至: {save_dir}")
+    print(f"==========================================")
 
 if __name__ == "__main__":
     main()
