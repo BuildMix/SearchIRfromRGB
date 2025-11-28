@@ -72,7 +72,7 @@ def correlation_layer(feat_rgb, feat_ir):
     return correlation_matrix
 
 # ==========================================
-# 智能缩放
+# RANSAC随机抽样一致性算法
 # ==========================================
 def ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
     B, N, N_dim = corr_matrix.shape
