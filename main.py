@@ -26,7 +26,6 @@ def main():
     results_txt_path = os.path.join(save_dir, 'results.txt')
 
     print(f"==========================================")
-    print(f"  批量配准任务启动")
     print(f"  输出目录: {save_dir}")
     print(f"==========================================\n")
 

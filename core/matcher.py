@@ -41,7 +41,7 @@ def ransac_smart(corr_matrix, norm_box, sobel_map, feat_size, orig_size):
     valid_matches_dst = []
     
     sobel_threshold = 15 
-    search_radius = W_orig // 3 
+    search_radius = W_orig // 3 #设定搜索半径为原始图像宽度的 1/3
     feat_search_radius = search_radius * (W_feat / W_orig)
 
     # 匹配点筛选
